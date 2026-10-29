@@ -4,7 +4,8 @@
 - "loto": 2 số cuối của cả 27 giải
 - "de":   2 số cuối giải Đặc biệt
 - "kep":  các lô kép (00, 11, ..., 99) trong 27 giải
-- "dekep": giải Đặc biệt khi 2 số cuối là kép
+- "cap":  cặp lô lộn (59-95, ...) trong 27 giải; mỗi cặp ghi bằng số nhỏ hơn (59), không gồm kép
+- "dekep": giải Đặc biệt khi 2 số cuối là kép (chỉ dùng cho thống kê, không gợi ý)
 """
 from collections import Counter
 
@@ -14,12 +15,25 @@ from scipy.stats import chisquare
 
 from .data_loader import KEP
 
-TARGETS = ("loto", "de", "kep", "dekep")
+TARGETS = ("loto", "de", "kep", "cap")  # các loại được gợi ý
+CAP = [10 * a + b for a in range(10) for b in range(a + 1, 10)]  # 45 cặp lộn: 01-10, ..., 89-98
+
+
+def lon(n: int) -> int:
+    """Số lộn: 59 -> 95."""
+    return n % 10 * 10 + n // 10
 
 
 def universe(target: str = "loto") -> list[int]:
     """Tập số có thể ra với mỗi target."""
+    if target == "cap":
+        return CAP
     return KEP if target in ("kep", "dekep") else list(range(100))
+
+
+def label(target: str, n: int) -> str:
+    """Cách hiển thị một số: cặp lộn hiện cả 2 số (59-95), còn lại 2 chữ số."""
+    return f"{n:02d}-{lon(n):02d}" if target == "cap" else f"{n:02d}"
 
 
 def draws(df: pd.DataFrame, target: str = "loto") -> list[list[int]]:
@@ -30,6 +44,8 @@ def draws(df: pd.DataFrame, target: str = "loto") -> list[list[int]]:
         return [[n] for n in df["db"]]
     if target == "kep":
         return [[n for n in nums if n in KEP] for nums in df["numbers"]]
+    if target == "cap":
+        return [[min(n, lon(n)) for n in nums if n not in KEP] for nums in df["numbers"]]
     if target == "dekep":
         return [[n] if n in KEP else [] for n in df["db"]]
     raise ValueError(f"target không hợp lệ: {target}")

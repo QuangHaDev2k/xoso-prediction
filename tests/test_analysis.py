@@ -23,6 +23,16 @@ def test_targets_shapes():
     assert list(analysis.frequency(df, "kep").index) == [0, 11, 22, 33, 44, 55, 66, 77, 88, 99]
     assert analysis.matrix(df, "loto").sum() == 30 * 27
     assert analysis.matrix(df, "dekep").sum() == df["db"].isin(range(0, 100, 11)).sum()
+    kep = sum(n % 11 == 0 for nums in df["numbers"] for n in nums)
+    assert analysis.matrix(df, "cap").sum() == 30 * 27 - kep
+
+
+def test_cap_pairs():
+    assert len(analysis.CAP) == 45 and 59 in analysis.CAP and 95 not in analysis.CAP
+    assert analysis.label("cap", 59) == "59-95" and analysis.label("cap", 9) == "09-90"
+    import pandas as pd
+    df = pd.DataFrame({"numbers": [[95, 59, 33, 1]]})
+    assert analysis.draws(df, "cap") == [[59, 59, 1]]
 
 
 def test_dau_duoi_and_kep_stats():

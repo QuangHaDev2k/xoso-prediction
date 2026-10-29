@@ -4,7 +4,7 @@
 
 - GET  /              báo cáo HTML (tự tạo nếu chưa có)
 - POST /api/update    tải kết quả mới nhất từ rongbachkim.com rồi tính lại báo cáo
-- POST /api/predict   tính lại dự đoán kỳ tiếp theo (tham số ?k=5)
+- POST /api/predict   tính lại dự đoán kỳ tiếp theo
 """
 import argparse
 import json
@@ -12,7 +12,7 @@ import threading
 import traceback
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 import pandas as pd
 
@@ -21,21 +21,13 @@ from .predict import build_report
 from .report import REPORT_FILE
 
 _lock = threading.Lock()  # tránh chạy crawler/backtest song song khi bấm nút liên tục
-_state = {"k": 5}
-
-
-def _parse_k(query: str) -> int:
-    k = int(parse_qs(query).get("k", [_state["k"]])[0])
-    if not 1 <= k <= 20:
-        raise ValueError("Số gợi ý phải từ 1 đến 20")
-    return k
 
 
 class UserError(Exception):
     """Lỗi có thông báo tiếng Việt hiển thị thẳng cho người dùng."""
 
 
-def do_update(k: int) -> dict:
+def do_update() -> dict:
     try:
         added, pending = crawler.update()
     except (OSError, TimeoutError) as e:  # URLError, HTTPError, mất mạng, timeout
@@ -44,7 +36,7 @@ def do_update(k: int) -> dict:
     except ValueError as e:  # JSON không hợp lệ
         raise UserError("rongbachkim.com trả về dữ liệu không đọc được, có thể trang đang "
                         f"bảo trì hoặc đã đổi cấu trúc. Thử lại sau. (chi tiết: {e})") from e
-    df, _, _ = build_report(k)
+    df, _, _ = build_report()
     last = df["date"].max()
     msg = (f"Đã thêm {added} kỳ mới, kết quả mới nhất ngày {last:%d/%m/%Y}." if added
            else f"Chưa có kết quả mới (mới nhất: {last:%d/%m/%Y}).")
@@ -53,12 +45,12 @@ def do_update(k: int) -> dict:
     return {"added": added, "latest": f"{last:%Y-%m-%d}", "message": msg}
 
 
-def do_predict(k: int) -> dict:
-    df, results, _ = build_report(k)
+def do_predict() -> dict:
+    df, results, _ = build_report()
     nxt = df["date"].max() + pd.Timedelta(days=1)
     picks = {t: r["predict"]["so"].tolist() for t, r in results.items()}
-    return {"date": f"{nxt:%Y-%m-%d}", "k": k, "picks": picks,
-            "message": f"Đã dự đoán kỳ {nxt:%d/%m/%Y} ({k} số mỗi loại)."}
+    return {"date": f"{nxt:%Y-%m-%d}", "picks": picks,
+            "message": f"Đã dự đoán kỳ {nxt:%d/%m/%Y}."}
 
 
 ACTIONS = {"/api/update": do_update, "/api/predict": do_predict}
@@ -81,7 +73,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, b"Not found", "text/plain")
         with _lock:
             if not REPORT_FILE.exists():
-                build_report(_state["k"])
+                build_report()
         self._send(200, REPORT_FILE.read_bytes(), "text/html; charset=utf-8")
 
     def do_POST(self):
@@ -89,15 +81,10 @@ class Handler(BaseHTTPRequestHandler):
         action = ACTIONS.get(url.path)
         if not action:
             return self._json(404, {"error": "Không có API này"})
-        try:
-            k = _parse_k(url.query)
-        except ValueError as e:
-            return self._json(400, {"error": str(e)})
         if not _lock.acquire(blocking=False):
             return self._json(409, {"error": "Đang xử lý yêu cầu trước, thử lại sau ít giây"})
         try:
-            _state["k"] = k
-            self._json(200, action(k))
+            self._json(200, action())
         except UserError as e:
             self._json(502, {"error": str(e)})
         except Exception as e:

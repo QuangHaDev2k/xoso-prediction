@@ -5,14 +5,18 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import analysis
+from . import analysis, tracking
 from .crawler import VN_TZ
 from .predict import TARGET_NAMES, kep_outlook
 
 REPORT_FILE = Path(__file__).resolve().parent.parent / "reports" / "report.html"
 
 STRATEGY_NAMES = {"hot": "Hot (ra nhiều 30 kỳ)", "gan": "Gan (lâu chưa ra)",
-                  "combo": "Kết hợp", "random": "Ngẫu nhiên", "ly_thuyet": "Xác suất lý thuyết"}
+                  "combo": "Kết hợp", "ewma": "Tần suất giảm dần (EWMA)",
+                  "bayes": "Bayes (Dirichlet)", "markov": "Markov (theo kỳ trước)",
+                  "digit": "Đầu × đuôi", "hazard": "Rủi ro theo gan",
+                  "ensemble": "Bỏ phiếu (Borda)", "hedge": "Trọng số thích ứng (Hedge)",
+                  "random": "Ngẫu nhiên", "ly_thuyet": "Xác suất lý thuyết"}
 
 
 def bar_chart(labels: list[str], values: list[float], highlight: set[str] = frozenset(),
@@ -77,7 +81,7 @@ def prize_table(prizes: list[str]) -> str:
     return f'<table class="prizes"><tbody>{"".join(rows)}</tbody></table>'
 
 
-def toolbar(next_date: str, k: int, actions_url: str | None) -> str:
+def toolbar(next_date: str, actions_url: str | None) -> str:
     """Thanh nút. actions_url != None: trang tĩnh trên GitHub Pages, thay nút bằng link Run workflow."""
     if actions_url is not None:
         link = (f' Cập nhật ngay: bấm <a href="{escape(actions_url)}" target="_blank" rel="noopener">'
@@ -87,7 +91,6 @@ def toolbar(next_date: str, k: int, actions_url: str | None) -> str:
     return f"""<div class="toolbar">
   <button id="btn-update" data-api="/api/update">⟳ Tải kết quả mới nhất</button>
   <button id="btn-predict" class="primary" data-api="/api/predict">Dự đoán kỳ {next_date}</button>
-  <label>Số gợi ý <input id="k" type="number" min="1" max="20" value="{k}"></label>
   <span id="status"></span>
 </div>"""
 
@@ -96,21 +99,95 @@ def _pct(x: float) -> str:
     return f"{x:.1%}"
 
 
-def _prediction_card(target: str, r: dict, k: int) -> str:
+def _pval(x: float) -> str:
+    return "" if pd.isna(x) else f"{x:.2f}"
+
+
+def _unit(target: str) -> str:
+    return "cặp" if target == "cap" else "số"
+
+
+def _prediction_card(target: str, r: dict) -> str:
+    k = r["k"]
     pred = r["predict"].rename(columns={"so": "Số", "diem": "Điểm", "ra_30_ky": "Ra 30 kỳ",
                                         "ra_tong": "Ra tổng", "gan": "Gan", "gan_max": "Gan max"})
-    chips = "".join(f'<span class="chip">{s}</span>' for s in pred["Số"])
+    balls = "".join(f'<span class="ball{" pair" if "-" in s else ""}">{s}</span>' for s in pred["Số"])
     bt = r["backtest"]
     bt_rows = pd.DataFrame({"Chiến lược": [STRATEGY_NAMES[s] for s in bt.index],
-                            f"Tỉ lệ trúng ≥1/{k} số": [_pct(v) for v in bt.values]})
-    return (f'<section class="card"><h3>{escape(TARGET_NAMES[target])}</h3>'
-            f'<div class="chips">{chips}</div>'
+                            f"Tỉ lệ trúng ≥1/{k} {_unit(target)}": [_pct(v) for v in bt["ti_le"]],
+                            "p (Holm)": [_pval(v) for v in bt["p_holm"]]})
+    sys_rate, theory = bt.loc[tracking.SYSTEM_STRATEGY, "ti_le"], bt.loc["ly_thuyet", "ti_le"]
+    return (f'<section class="card pick t-{target}">'
+            f'<div class="pick-head"><h3>{TARGET_SHORT[target]}</h3>'
+            f'<span class="badge">{k} {_unit(target)}</span></div>'
+            f'<p class="sub">{escape(TARGET_NAMES[target])}</p>'
+            f'<div class="balls">{balls}</div>'
+            f'<div class="bt-line"><span>Backtest 5 năm</span><b>{_pct(sys_rate)}</b>'
+            f'<span>chọn bừa {_pct(theory)}</span></div>'
             f'<details><summary>Chi tiết điểm</summary>{table(pred)}</details>'
-            f'<h4>Backtest</h4>{table(bt_rows, "compact")}</section>')
+            f'<details><summary>Backtest {len(bt) - 1} chiến lược</summary>'
+            f'{table(bt_rows, "compact")}</details></section>')
 
 
-def write_report(df: pd.DataFrame, results: dict, k: int, path: Path = REPORT_FILE,
-                 actions_url: str | None = None) -> Path:
+TARGET_SHORT = {"de": "Đề", "loto": "Loto", "kep": "Lô kép", "cap": "Cặp lộn"}
+
+
+def _picks_cell(row) -> str:
+    """Các số gợi ý, số đã về được tô màu; kèm trạng thái."""
+    if row is None:
+        return "<td></td>"
+    hit, lb = set(row["trung_so"]), lambda n: analysis.label(row["target"], n)
+    nums = " ".join(f'<b class="got">{lb(n)}</b>' if n in hit else lb(n) for n in row["so"])
+    tag = {"cho_ket_qua": '<span class="tag">chờ</span>', "khong_quay": '<span class="tag">nghỉ</span>'}
+    mark = tag.get(row["trang_thai"], '<span class="tag ok">trúng</span>' if row["trung"] else "")
+    return f"<td>{nums} {mark}</td>"
+
+
+def tracking_section(df: pd.DataFrame, ks: dict[str, int], path: Path = tracking.PRED_FILE,
+                     last: int = 15) -> str:
+    """Thống kê sổ theo dõi: tỉ lệ trúng thực tế của phần gợi ý + chi tiết các kỳ gần nhất."""
+    data = tracking.report_data(df, ks, path)
+    scored, summ = data["scored"], data["summary"]
+    if scored.empty:
+        return ('<div class="card"><p class="meta">Chưa có dự đoán nào được ghi với số gợi ý hiện tại. '
+                "Từ lần dự đoán tới, số gợi ý của mọi chiến lược sẽ được ghi lại trước giờ quay "
+                "và chấm điểm khi có kết quả.</p></div>")
+    n_done = scored.loc[scored["trang_thai"] == "da_cham", "date"].nunique()
+    intro = (f'<p class="meta">Ghi từ kỳ {data["since"]:%d/%m/%Y} · {n_done} kỳ đã chấm · '
+             f"chỉ tính dự đoán được ghi trước giờ quay (18h).</p>")
+
+    mine = summ[summ["strategy"] == tracking.SYSTEM_STRATEGY]
+    main_tbl = pd.DataFrame({
+        "Loại": [f"{TARGET_SHORT[t]} ({k} {_unit(t)})" for t, k in zip(mine["target"], mine["k"])],
+        "Số kỳ": mine["so_ky"], "Trúng": mine["trung"],
+        "Tỉ lệ trúng": [_pct(v) for v in mine["ti_le"]],
+        "Lý thuyết": [_pct(v) for v in mine["ly_thuyet"]],
+        "p": [_pval(v) for v in mine["p"]]})
+    all_tbl = pd.DataFrame({
+        "Loại": [TARGET_SHORT[t] for t in summ["target"]],
+        "Chiến lược": [STRATEGY_NAMES.get(x, x) for x in summ["strategy"]],
+        "Số kỳ": summ["so_ky"], "Tỉ lệ": [_pct(v) for v in summ["ti_le"]],
+        "Lý thuyết": [_pct(v) for v in summ["ly_thuyet"]], "p": [_pval(v) for v in summ["p"]]})
+
+    sys_rows = scored[scored["strategy"] == tracking.SYSTEM_STRATEGY]
+    dates = sorted(sys_rows["date"].unique(), reverse=True)[:last]
+    by = {(d, t): r for d, t, r in zip(sys_rows["date"], sys_rows["target"], sys_rows.to_dict("records"))}
+    head = "".join(f"<th>{TARGET_SHORT[t]}</th>" for t in analysis.TARGETS)
+    body = "".join(f"<tr><td>{pd.Timestamp(d):%d/%m/%Y}</td>"
+                   + "".join(_picks_cell(by.get((d, t))) for t in analysis.TARGETS) + "</tr>"
+                   for d in dates)
+    recent = (f'<table class="track"><thead><tr><th>Kỳ</th>{head}</tr></thead>'
+              f"<tbody>{body}</tbody></table>")
+    return (f'<div class="card">{intro}'
+            f'<h3>Phần gợi ý (chiến lược "{STRATEGY_NAMES[tracking.SYSTEM_STRATEGY]}")</h3>'
+            f'{table(main_tbl, "compact") if len(mine) else "<p class=meta>Chưa có kỳ nào được chấm.</p>"}'
+            f"<details><summary>Tất cả chiến lược</summary>{table(all_tbl, 'compact')}</details>"
+            f'<h4>{len(dates)} kỳ gần nhất · số <b class="got">tô màu</b> là số đã về</h4>'
+            f'<div class="table-wrap">{recent}</div></div>')
+
+
+def write_report(df: pd.DataFrame, results: dict, path: Path = REPORT_FILE,
+                 actions_url: str | None = None, tracking_path: Path = tracking.PRED_FILE) -> Path:
     """Ghi báo cáo HTML. actions_url != None => bản tĩnh (không có nút gọi server)."""
     nums = [f"{n:02d}" for n in range(100)]
     picks = {t: set(r["predict"]["so"]) for t, r in results.items()}
@@ -131,7 +208,8 @@ def write_report(df: pd.DataFrame, results: dict, k: int, path: Path = REPORT_FI
         "Loto": [" ".join(f"{n:02d}" for n in sorted(ns)) for ns in recent["numbers"]],
     })
 
-    cards = "".join(_prediction_card(t, r, k) for t, r in results.items())
+    cards = "".join(_prediction_card(t, r) for t, r in results.items())
+    ks = {t: r["k"] for t, r in results.items()}
     charts = []
     if "de" in results:
         charts.append(("Tần suất 2 số cuối ĐB (00–99)",
@@ -170,13 +248,15 @@ def write_report(df: pd.DataFrame, results: dict, k: int, path: Path = REPORT_FI
     next_day = last + pd.Timedelta(days=1)
     html = TEMPLATE.format(
         last_date=f"{last:%d/%m/%Y}", next_date=f"{next_day:%d/%m/%Y}",
-        toolbar=toolbar(f"{next_day:%d/%m/%Y}", k, actions_url),
-        latest=prize_table(df.iloc[-1]["prizes"]),
+        toolbar=toolbar(f"{next_day:%d/%m/%Y}", actions_url),
+        latest=prize_table(df.iloc[-1]["prizes"]), db_full=escape(df.iloc[-1]["prizes"][0]),
         period=f"{df['date'].min():%d/%m/%Y} – {last:%d/%m/%Y}",
-        n=len(df), k=k, generated=datetime.now(VN_TZ).strftime("%d/%m/%Y %H:%M (giờ VN)"),
+        n=len(df), generated=datetime.now(VN_TZ).strftime("%d/%m/%Y %H:%M (giờ VN)"),
         cards=cards, charts=charts_html, stats=stats_html,
         kep_tbl=table(kep_tbl, "compact"), nhay_tbl=table(nhay_tbl, "compact"),
         recent=table(recent_tbl, "recent"),
+        suggest=" · ".join(f"{TARGET_SHORT[t]} {k} {_unit(t)}" for t, k in ks.items()),
+        tracking=tracking_section(df, ks, tracking_path),
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(html, encoding="utf-8")
@@ -189,115 +269,263 @@ TEMPLATE = """<!doctype html>
 <title>Thống kê XSMB</title>
 <style>
 :root {{
-  color-scheme: light;
-  --surface: #f6f6f4; --card: #fcfcfb; --border: #e3e2de;
-  --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #7a7974;
-  --series-1: #2a78d6; --accent: #eb6834; --grid: #e3e2de;
+  color-scheme: dark;
+  --surface: #0b0d14; --card: #141824; --card-2: #1a2030; --border: #262d40;
+  --text-primary: #eef1f8; --text-secondary: #a9b1c6; --text-muted: #6f7890;
+  --series-1: #5b8cff; --accent: #ff4d5e; --gold: #f5b942; --grid: #262d40;
+  --hero-1: #ff4d5e33; --hero-2: #f5b94226; --nav: #0b0d14cc; --shadow: 0 8px 30px #0006;
+  --c-loto: #f5b942; --c-de: #ff4d5e; --c-kep: #b07cff; --c-cap: #2ed3b7;
 }}
-@media (prefers-color-scheme: dark) {{
-  :root:not([data-theme="light"]) {{
-    color-scheme: dark;
-    --surface: #121211; --card: #1a1a19; --border: #2e2e2c;
-    --text-primary: #f0efec; --text-secondary: #c3c2b7; --text-muted: #8f8e86;
-    --series-1: #3987e5; --accent: #d95926; --grid: #2e2e2c;
+@media (prefers-color-scheme: light) {{
+  :root:not([data-theme="dark"]) {{
+    color-scheme: light;
+    --surface: #f4f5f9; --card: #ffffff; --card-2: #f7f8fb; --border: #e3e6ee;
+    --text-primary: #10131c; --text-secondary: #4b5368; --text-muted: #7c8499;
+    --series-1: #2f6bff; --accent: #e5304a; --gold: #c98a0b; --grid: #e3e6ee;
+    --hero-1: #e5304a22; --hero-2: #f5b94233; --nav: #f4f5f9d9; --shadow: 0 6px 24px #1a20301a;
+    --c-loto: #d99a10; --c-de: #e5304a; --c-kep: #8b55e8; --c-cap: #10a88f;
   }}
 }}
-:root[data-theme="dark"] {{
-  color-scheme: dark;
-  --surface: #121211; --card: #1a1a19; --border: #2e2e2c;
-  --text-primary: #f0efec; --text-secondary: #c3c2b7; --text-muted: #8f8e86;
-  --series-1: #3987e5; --accent: #d95926; --grid: #2e2e2c;
+:root[data-theme="light"] {{
+  color-scheme: light;
+  --surface: #f4f5f9; --card: #ffffff; --card-2: #f7f8fb; --border: #e3e6ee;
+  --text-primary: #10131c; --text-secondary: #4b5368; --text-muted: #7c8499;
+  --series-1: #2f6bff; --accent: #e5304a; --gold: #c98a0b; --grid: #e3e6ee;
+  --hero-1: #e5304a22; --hero-2: #f5b94233; --nav: #f4f5f9d9; --shadow: 0 6px 24px #1a20301a;
+  --c-loto: #d99a10; --c-de: #e5304a; --c-kep: #8b55e8; --c-cap: #10a88f;
 }}
 * {{ box-sizing: border-box; }}
+html {{ scroll-behavior: smooth; }}
 body {{ margin: 0; background: var(--surface); color: var(--text-primary);
   font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }}
-main {{ max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }}
-h1 {{ font-size: 24px; margin: 0 0 4px; }}
-h2 {{ font-size: 18px; margin: 32px 0 12px; }}
+main {{ max-width: 1120px; margin: 0 auto; padding: 0 16px 64px; }}
+h2 {{ font-size: 20px; margin: 0 0 14px; display: flex; align-items: center; gap: 10px; }}
+h2::before {{ content: ""; width: 4px; height: 20px; border-radius: 2px;
+  background: linear-gradient(var(--accent), var(--gold)); }}
 h3 {{ font-size: 15px; margin: 0 0 10px; }}
 h4 {{ font-size: 13px; margin: 14px 0 6px; color: var(--text-secondary); }}
+section.block {{ scroll-margin-top: 72px; padding-top: 36px; }}
 .meta {{ color: var(--text-secondary); margin: 0; }}
-.warn {{ border-left: 3px solid var(--accent); background: var(--card); padding: 10px 14px;
-  margin: 16px 0; color: var(--text-secondary); border-radius: 4px; }}
+a {{ color: var(--series-1); }}
+
+/* Banner */
+.hero {{ position: relative; overflow: hidden; border-bottom: 1px solid var(--border);
+  background: radial-gradient(600px 300px at 10% 0%, var(--hero-1), transparent 70%),
+              radial-gradient(500px 300px at 90% 20%, var(--hero-2), transparent 70%), var(--surface); }}
+.hero-in {{ max-width: 1120px; margin: 0 auto; padding: 32px 16px 24px; display: grid; gap: 20px;
+  grid-template-columns: minmax(0, 1fr) auto; align-items: end; }}
+.hero h1 {{ font-size: clamp(26px, 4vw, 38px); line-height: 1.1; margin: 0 0 8px; letter-spacing: -.02em; }}
+.hero h1 span {{ background: linear-gradient(90deg, var(--accent), var(--gold));
+  -webkit-background-clip: text; background-clip: text; color: transparent; }}
+.spot {{ background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 14px 18px;
+  box-shadow: var(--shadow); text-align: right; }}
+.spot .label {{ color: var(--text-secondary); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }}
+.spot .db {{ font: 800 34px/1.1 ui-monospace, Menlo, monospace; letter-spacing: .08em;
+  background: linear-gradient(90deg, var(--accent), var(--gold)); -webkit-background-clip: text;
+  background-clip: text; color: transparent; }}
+.warn {{ border: 1px solid var(--border); border-left: 3px solid var(--accent); background: var(--card);
+  padding: 10px 14px; margin: 0; color: var(--text-secondary); border-radius: 10px; font-size: 13px; }}
+.hero .warn {{ grid-column: 1 / -1; }}
+
+/* Thanh điều hướng dính */
+nav.jump {{ position: sticky; top: 0; z-index: 20; background: var(--nav);
+  backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border-bottom: 1px solid var(--border); }}
+nav.jump .in {{ max-width: 1120px; margin: 0 auto; padding: 10px 16px; display: flex; gap: 6px;
+  align-items: center; overflow-x: auto; scrollbar-width: none; }}
+nav.jump .in::-webkit-scrollbar {{ display: none; }}
+nav.jump a {{ flex: none; text-decoration: none; color: var(--text-secondary); font-weight: 600; font-size: 13px;
+  padding: 7px 12px; border-radius: 999px; border: 1px solid transparent; transition: .15s; }}
+nav.jump a:hover {{ color: var(--text-primary); background: var(--card); }}
+nav.jump a.on {{ color: #fff; background: linear-gradient(90deg, var(--accent), #ff7a45);
+  box-shadow: 0 4px 14px #ff4d5e55; }}
+nav.jump .sp {{ flex: 1; }}
+#theme {{ flex: none; border: 1px solid var(--border); background: var(--card); color: var(--text-primary);
+  border-radius: 999px; width: 34px; height: 34px; cursor: pointer; font-size: 15px; }}
+#top {{ position: fixed; right: 18px; bottom: 18px; z-index: 30; width: 46px; height: 46px; border-radius: 50%;
+  border: none; cursor: pointer; color: #fff; font-size: 20px; box-shadow: 0 8px 24px #ff4d5e66;
+  background: linear-gradient(135deg, var(--accent), var(--gold)); opacity: 0; pointer-events: none;
+  transform: translateY(10px); transition: .2s; }}
+#top.show {{ opacity: 1; pointer-events: auto; transform: none; }}
+
+/* Thẻ */
 .grid2 {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); gap: 16px; }}
-.card {{ background: var(--card); border: 1px solid var(--border); border-radius: 8px;
-  padding: 16px; margin: 0; min-width: 0; }}
+.cards {{ grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); }}
+.card {{ background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+  padding: 18px; margin: 0; min-width: 0; box-shadow: var(--shadow); }}
 figcaption {{ font-weight: 600; margin-bottom: 8px; }}
-.chips {{ display: flex; flex-wrap: wrap; gap: 8px; }}
-.chip {{ font: 600 20px/1 ui-monospace, Menlo, monospace; padding: 8px 12px; border-radius: 6px;
-  border: 1px solid var(--border); background: var(--surface); }}
-details {{ margin-top: 10px; }}
-summary {{ cursor: pointer; color: var(--text-secondary); }}
+.wide {{ grid-column: 1 / -1; }}
+.pick {{ --c: var(--series-1); position: relative; overflow: hidden; }}
+.pick::before {{ content: ""; position: absolute; inset: 0 0 auto; height: 3px;
+  background: linear-gradient(90deg, var(--c), transparent); }}
+.t-loto {{ --c: var(--c-loto); }} .t-de {{ --c: var(--c-de); }}
+.t-kep {{ --c: var(--c-kep); }} .t-cap {{ --c: var(--c-cap); }}
+.pick-head {{ display: flex; align-items: center; justify-content: space-between; }}
+.pick-head h3 {{ font-size: 18px; margin: 0; }}
+.badge {{ font-size: 12px; font-weight: 700; color: var(--c); border: 1px solid var(--c);
+  border-radius: 999px; padding: 2px 10px; }}
+.pick .sub {{ color: var(--text-muted); font-size: 12px; margin: 2px 0 14px; }}
+.balls {{ display: flex; flex-wrap: wrap; gap: 10px; }}
+.ball {{ width: 52px; height: 52px; border-radius: 50%; display: grid; place-items: center;
+  font: 800 20px/1 ui-monospace, Menlo, monospace; color: #fff; text-shadow: 0 1px 2px #0006;
+  background: radial-gradient(circle at 30% 22%, #ffffff59, transparent 32%),
+              radial-gradient(circle at 35% 30%, var(--c), color-mix(in srgb, var(--c) 55%, #000) 75%);
+  box-shadow: 0 6px 16px color-mix(in srgb, var(--c) 40%, transparent), inset 0 -4px 8px #0004; }}
+.ball.pair {{ width: auto; padding: 0 20px; border-radius: 999px; }}
+.bt-line {{ display: flex; align-items: baseline; gap: 8px; margin: 16px 0 4px; padding: 10px 12px;
+  border-radius: 10px; background: var(--card-2); color: var(--text-muted); font-size: 12px; }}
+.bt-line b {{ color: var(--text-primary); font-size: 16px; }}
+details {{ margin-top: 8px; }}
+summary {{ cursor: pointer; color: var(--text-secondary); font-size: 13px; padding: 4px 0; }}
+summary:hover {{ color: var(--text-primary); }}
+
+/* Bảng */
 .table-wrap {{ overflow-x: auto; }}
 table {{ border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }}
-th, td {{ text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border); }}
-th {{ color: var(--text-secondary); font-weight: 600; }}
+th, td {{ text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }}
+th {{ color: var(--text-muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }}
+tbody tr:hover td {{ background: var(--card-2); }}
 table.recent td:last-child {{ font-family: ui-monospace, Menlo, monospace; font-size: 12px; }}
+table.track td {{ font-family: ui-monospace, Menlo, monospace; font-size: 12px; white-space: nowrap; }}
+.got {{ color: var(--accent); }}
+.tag {{ font: 11px system-ui, sans-serif; color: var(--text-muted); border: 1px solid var(--border);
+  border-radius: 4px; padding: 0 4px; }}
+.tag.ok {{ color: var(--accent); border-color: var(--accent); }}
+.prizes td:first-child {{ color: var(--text-secondary); width: 80px; }}
+.prizes td:last-child {{ font: 600 16px ui-monospace, Menlo, monospace; word-spacing: 10px; }}
+.prizes tr.db td:last-child {{ color: var(--accent); font-size: 24px; font-weight: 800; }}
+
+/* Số liệu */
 .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(min(170px, 100%), 1fr)); gap: 12px; }}
-.stat .label {{ color: var(--text-secondary); font-size: 13px; }}
-.stat .value {{ font-size: 26px; font-weight: 650; }}
+.stat {{ background: var(--card-2); border-radius: 10px; padding: 12px; }}
+.stat .label {{ color: var(--text-secondary); font-size: 12px; }}
+.stat .value {{ font-size: 26px; font-weight: 750; }}
 .stat .sub {{ color: var(--text-muted); font-size: 12px; }}
+
+/* Biểu đồ */
 .chart {{ width: 100%; height: auto; display: block; }}
 .chart .bar {{ fill: var(--series-1); }}
 .chart .bar.hl {{ fill: var(--accent); }}
 .chart .grid {{ stroke: var(--grid); stroke-width: 1; }}
 .chart .tick {{ fill: var(--text-muted); font-size: 11px; }}
-.wide {{ grid-column: 1 / -1; }}
-.toolbar {{ display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 16px 0; }}
-.toolbar button {{ font-family: inherit; font-size: 14px; font-weight: 600; padding: 10px 16px; border-radius: 6px; cursor: pointer;
-  border: 1px solid var(--border); background: var(--card); color: var(--text-primary); }}
-.toolbar button.primary {{ background: var(--series-1); border-color: var(--series-1); color: #fff; }}
-.toolbar button:disabled {{ opacity: .5; cursor: progress; }}
-.toolbar label {{ color: var(--text-secondary); }}
-.toolbar input {{ width: 52px; padding: 8px; border-radius: 6px; border: 1px solid var(--border);
-  background: var(--card); color: var(--text-primary); font: inherit; }}
-#status {{ color: var(--text-secondary); font-size: 13px; }}
-.toolbar .note {{ color: var(--text-secondary); }}
-a {{ color: var(--series-1); }}
-#status.error {{ color: var(--accent); }}
-.prizes td:first-child {{ color: var(--text-secondary); width: 80px; }}
-.prizes td:last-child {{ font: 600 16px ui-monospace, Menlo, monospace; word-spacing: 10px; }}
-.prizes tr.db td:last-child {{ color: var(--accent); font-size: 22px; }}
 .chart .hitbox {{ fill: transparent; }}
 .chart .hit:hover .bar {{ opacity: .75; }}
 .legend {{ color: var(--text-secondary); font-size: 13px; margin: 0 0 12px; }}
 .legend i {{ display: inline-block; width: 10px; height: 10px; border-radius: 2px;
   margin: 0 4px 0 12px; vertical-align: -1px; }}
 #tip {{ position: fixed; pointer-events: none; background: var(--text-primary); color: var(--card);
-  padding: 4px 8px; border-radius: 4px; font-size: 12px; display: none; z-index: 10; }}
-</style></head>
-<body><main>
-<h1>Thống kê &amp; dự đoán XSMB</h1>
-<p class="meta">{n} kỳ quay ({period}) · gợi ý {k} số mỗi loại · tạo lúc {generated}</p>
-<div class="warn">Xổ số là ngẫu nhiên — mỗi kỳ quay độc lập. Các "dự đoán" dưới đây chỉ là xếp hạng
-theo thống kê quá khứ; hãy so sánh dòng backtest với <b>xác suất lý thuyết</b> để thấy chúng không
-tốt hơn chọn bừa một cách có ý nghĩa.</div>
+  padding: 4px 8px; border-radius: 4px; font-size: 12px; display: none; z-index: 40; }}
 
-{toolbar}
+/* Nút */
+.toolbar {{ display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 14px 0 0; }}
+.toolbar button {{ font-family: inherit; font-size: 14px; font-weight: 700; padding: 10px 16px; border-radius: 10px;
+  cursor: pointer; border: 1px solid var(--border); background: var(--card); color: var(--text-primary); transition: .15s; }}
+.toolbar button:hover {{ transform: translateY(-1px); }}
+.toolbar button.primary {{ border: none; color: #fff; background: linear-gradient(90deg, var(--accent), #ff7a45);
+  box-shadow: 0 6px 18px #ff4d5e55; }}
+.toolbar button:disabled {{ opacity: .5; cursor: progress; transform: none; }}
+#status {{ color: var(--text-secondary); font-size: 13px; }}
+#status.error {{ color: var(--accent); }}
+.toolbar .note {{ color: var(--text-secondary); }}
 
-<h2>Kết quả mới nhất · {last_date}</h2>
-<div class="card table-wrap">{latest}</div>
+@media (max-width: 640px) {{
+  .hero-in {{ grid-template-columns: 1fr; }}
+  .spot {{ text-align: left; }}
+  .ball {{ width: 46px; height: 46px; font-size: 18px; }}
+}}
+</style>
+<script>try {{ const t = localStorage.getItem('theme'); if (t) document.documentElement.dataset.theme = t; }} catch (_) {{}}</script>
+</head>
+<body>
+<header class="hero" id="dau-trang"><div class="hero-in">
+  <div>
+    <h1>Thống kê &amp; dự đoán <span>XSMB</span></h1>
+    <p class="meta">{n} kỳ quay ({period}) · gợi ý: {suggest}</p>
+    <p class="meta" style="font-size:12px">Tạo lúc {generated}</p>
+    {toolbar}
+  </div>
+  <div class="spot">
+    <div class="label">Đặc biệt {last_date}</div>
+    <div class="db">{db_full}</div>
+  </div>
+  <div class="warn">Xổ số là ngẫu nhiên — mỗi kỳ quay độc lập. Các "dự đoán" chỉ là xếp hạng theo thống kê
+  quá khứ; hãy so sánh với <b>xác suất chọn bừa</b>. Cột <b>p (Holm)</b> &lt; 0,05 mới là dấu hiệu đáng chú ý.</div>
+</div></header>
 
-<h2>Gợi ý kỳ {next_date}</h2>
-<div class="grid2">{cards}</div>
+<nav class="jump" aria-label="Đi tới mục"><div class="in">
+  <a href="#goi-y">Gợi ý</a>
+  <a href="#ket-qua">Kết quả</a>
+  <a href="#theo-doi">Theo dõi</a>
+  <a href="#kep">Kép &amp; ĐB</a>
+  <a href="#bieu-do">Biểu đồ</a>
+  <a href="#gan-day">30 kỳ</a>
+  <span class="sp"></span>
+  <button id="theme" type="button" title="Đổi giao diện sáng/tối" aria-label="Đổi giao diện sáng/tối">◐</button>
+</div></nav>
 
-<h2>Thống kê kép &amp; đặc biệt</h2>
-<div class="card stats">{stats}</div>
-<div class="grid2" style="margin-top:16px">
-  <section class="card"><h3>10 lần ĐB về kép gần nhất</h3>{kep_tbl}</section>
-  <section class="card"><h3>Lô về nhiều nháy (30 kỳ)</h3>{nhay_tbl}</section>
-</div>
+<main>
+<section class="block" id="goi-y">
+  <h2>Gợi ý kỳ {next_date}</h2>
+  <div class="grid2 cards">{cards}</div>
+</section>
 
-<h2>Biểu đồ</h2>
-<p class="legend"><i style="background:var(--series-1)"></i>Số lần / số kỳ
-<i style="background:var(--accent)"></i>Số được gợi ý kỳ tới</p>
-<div class="grid2">{charts}</div>
+<section class="block" id="ket-qua">
+  <h2>Kết quả mới nhất · {last_date}</h2>
+  <div class="card table-wrap">{latest}</div>
+</section>
 
-<h2>30 kỳ gần nhất</h2>
-<div class="card table-wrap">{recent}</div>
+<section class="block" id="theo-doi">
+  <h2>Theo dõi dự đoán thực tế</h2>
+  {tracking}
+</section>
+
+<section class="block" id="kep">
+  <h2>Thống kê kép &amp; đặc biệt</h2>
+  <div class="card stats">{stats}</div>
+  <div class="grid2" style="margin-top:16px">
+    <section class="card"><h3>10 lần ĐB về kép gần nhất</h3>{kep_tbl}</section>
+    <section class="card"><h3>Lô về nhiều nháy (30 kỳ)</h3>{nhay_tbl}</section>
+  </div>
+</section>
+
+<section class="block" id="bieu-do">
+  <h2>Biểu đồ</h2>
+  <p class="legend"><i style="background:var(--series-1)"></i>Số lần / số kỳ
+  <i style="background:var(--accent)"></i>Số được gợi ý kỳ tới</p>
+  <div class="grid2">{charts}</div>
+</section>
+
+<section class="block" id="gan-day">
+  <h2>30 kỳ gần nhất</h2>
+  <div class="card table-wrap">{recent}</div>
+</section>
 </main>
+<button id="top" type="button" title="Lên đầu trang" aria-label="Lên đầu trang">↑</button>
 <div id="tip"></div>
 <script>
+// Điều hướng: tô sáng mục đang xem, hiện nút lên đầu trang
+const links = [...document.querySelectorAll('nav.jump a')];
+const spy = new IntersectionObserver(entries => {{
+  entries.forEach(e => {{
+    if (!e.isIntersecting) return;
+    links.forEach(a => a.classList.toggle('on', a.getAttribute('href') === '#' + e.target.id));
+    const on = links.find(a => a.classList.contains('on'));
+    if (on) on.scrollIntoView({{ block: 'nearest', inline: 'nearest' }});
+  }});
+}}, {{ rootMargin: '-80px 0px -60% 0px' }});
+document.querySelectorAll('section.block').forEach(s => spy.observe(s));
+const topBtn = document.getElementById('top');
+addEventListener('scroll', () => topBtn.classList.toggle('show', scrollY > 600), {{ passive: true }});
+topBtn.addEventListener('click', () => scrollTo({{ top: 0, behavior: 'smooth' }}));
+
+// Sáng/tối: nhớ lựa chọn trên trình duyệt này
+const root = document.documentElement;
+document.getElementById('theme').addEventListener('click', () => {{
+  const dark = root.dataset.theme ? root.dataset.theme === 'dark'
+    : !matchMedia('(prefers-color-scheme: light)').matches;
+  root.dataset.theme = dark ? 'light' : 'dark';
+  try {{ localStorage.setItem('theme', root.dataset.theme); }} catch (_) {{}}
+}});
+
 const tip = document.getElementById('tip');
 document.querySelectorAll('.hit').forEach(g => {{
   g.addEventListener('mousemove', e => {{
@@ -320,10 +548,9 @@ buttons.forEach(btn => btn.addEventListener('click', async () => {{
   status.className = '';
   status.textContent = btn.id === 'btn-update' ? 'Đang tải kết quả…' : 'Đang tính dự đoán và backtest…';
   try {{
-    const k = document.getElementById('k').value;
     let res;
     try {{
-      res = await fetch(btn.dataset.api + '?k=' + encodeURIComponent(k), {{ method: 'POST' }});
+      res = await fetch(btn.dataset.api, {{ method: 'POST' }});
     }} catch (_) {{
       throw new Error('Không kết nối được server. Mở terminal, chạy "python -m src.server" '
         + 'trong thư mục xoso-prediction rồi tải lại trang này.');

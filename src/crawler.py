@@ -9,7 +9,9 @@ from datetime import date, datetime, timedelta, timezone
 from .data_loader import DATA_FILE
 
 API_URL = "https://rongbachkim.com/ketqua.php?getkq&ngay={ngay}&days={days}&wday=0"
-MAX_DAYS = 300  # server giới hạn tối đa 300 ngày mỗi request
+MAX_DAYS = 300  # server giới hạn tối đa 300 kỳ quay mỗi request
+DEFAULT_YEARS = 5
+RETRIES = 3
 PRIZES_PER_DAY = 27
 VN_TZ = timezone(timedelta(hours=7))  # giờ Việt Nam, không có giờ mùa hè
 
@@ -27,11 +29,17 @@ def parse_response(text: str) -> list[tuple[str, list[str]]]:
 
 
 def fetch_range(end: date, days: int) -> list[tuple[str, list[str]]]:
-    """Lấy `days` ngày quay thưởng tính lùi từ `end` (gồm cả `end`)."""
+    """Lấy tối đa `days` kỳ quay tính lùi từ `end` (gồm cả `end`), thử lại khi lỗi mạng."""
     url = API_URL.format(ngay=end.isoformat(), days=min(days, MAX_DAYS))
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return parse_response(resp.read().decode("utf-8"))
+    for attempt in range(RETRIES):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return parse_response(resp.read().decode("utf-8"))
+        except (OSError, ValueError):
+            if attempt == RETRIES - 1:
+                raise
+            time.sleep(2 ** attempt * 5)
 
 
 def crawl(days: int = 365, end: date | None = None, stop_after: str | None = None,
@@ -74,29 +82,54 @@ def save_csv(rows: dict[str, list[str]], path=DATA_FILE) -> None:
             w.writerow([day, " ".join(rows[day])])
 
 
-def update(days: int = 365, path=DATA_FILE) -> tuple[int, list[str]]:
-    """Cập nhật CSV: nếu đã có dữ liệu thì chỉ lấy các ngày mới.
+def years_ago(years: int, today: date | None = None) -> date:
+    today = today or today_vn()
+    return today - timedelta(days=round(years * 365.25) - 1)
 
+
+def update(days: int | None = None, path=DATA_FILE) -> tuple[int, list[str]]:
+    """Cập nhật CSV, không bao giờ xoá dữ liệu đã có.
+
+    - Lấy các kỳ mới hơn kỳ mới nhất trong file.
+    - Nếu `days` được truyền (hoặc file rỗng: mặc định DEFAULT_YEARS năm) và dữ liệu chưa
+      phủ đủ, tải bổ sung các kỳ cũ hơn kỳ cũ nhất trong file.
     Kỳ chưa đủ 27 số (đang quay) không được lưu để lần sau tải lại.
     Trả về (số ngày thêm mới, các ngày đang quay dở).
     """
     existing = {d: n for d, n in read_csv(path).items() if len(n) == PRIZES_PER_DAY}
-    latest = max(existing) if existing else None
-    new = crawl(days, stop_after=latest)
+    today = today_vn()
+    if days is None and not existing:
+        days = (today - years_ago(DEFAULT_YEARS, today)).days + 1
+
+    new: list[tuple[str, list[str]]] = []
+    if existing:
+        latest, earliest = max(existing), min(existing)
+        new += crawl((today - date.fromisoformat(latest)).days + 1, end=today, stop_after=latest)
+        start = today - timedelta(days=days - 1) if days else None
+        if start and start.isoformat() < earliest:
+            end = date.fromisoformat(earliest) - timedelta(days=1)
+            new += crawl((end - start).days + 1, end=end)
+    else:
+        new += crawl(days, end=today)
+
     pending = [d for d, n in new if len(n) != PRIZES_PER_DAY]
     added = {d: n for d, n in new if d not in existing and len(n) == PRIZES_PER_DAY}
     existing.update(added)
-    # chỉ giữ cửa sổ `days` ngày gần nhất
-    cutoff = (today_vn() - timedelta(days=days - 1)).isoformat()
-    save_csv({d: n for d, n in existing.items() if d >= cutoff}, path)
+    save_csv(existing, path)
     return len(added), pending
 
 
 def main():
     parser = argparse.ArgumentParser(description="Tải kết quả XSMB từ rongbachkim.com")
-    parser.add_argument("--days", type=int, default=365, help="số ngày lịch tính lùi từ hôm nay")
+    parser.add_argument("--days", type=int,
+                        help="đảm bảo có dữ liệu ít nhất N ngày lịch tính lùi từ hôm nay "
+                             "(tải bổ sung kỳ cũ nếu thiếu; không bao giờ xoá dữ liệu)")
+    parser.add_argument("--years", type=float, help="như --days nhưng tính theo năm")
     args = parser.parse_args()
-    added, pending = update(args.days)
+    days = args.days
+    if args.years:
+        days = (today_vn() - years_ago(args.years)).days + 1
+    added, pending = update(days)
     total = len(read_csv())
     print(f"Thêm {added} ngày mới. Tổng {total} kỳ trong {DATA_FILE}")
     if pending:
